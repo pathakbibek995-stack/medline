@@ -1,0 +1,9 @@
+.git/
+.openai/
+.wrangler/
+.env*
+.dev.vars*
+dist/
+outputs/
+site.tar.gz
+wrangler.jsonc

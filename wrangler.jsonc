@@ -1,0 +1,22 @@
+{
+  "name": "medicine-sales-manager-api",
+  "main": "dist/server/index.js",
+  "compatibility_date": "2024-12-01",
+  "account_id": "cc5ca7f70560732a92bcc2610955ead8",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "OWNER_EMAIL": "pathakbibek995@gmail.com",
+    "GOOGLE_CLIENT_ID": "970655492783-6qnhkrluflt4k3mmssa1jbc1r46qdlqg.apps.googleusercontent.com",
+    "APP_ORIGIN": "https://medicine-sales-manager.vercel.app",
+    "WORKER_PROXY_ONLY": "true"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "medicine-sales-manager-production",
+      "database_id": "07977582-8df7-419c-b307-e7b71c5f9d2f",
+      "migrations_dir": "drizzle"
+    }
+  ]
+}

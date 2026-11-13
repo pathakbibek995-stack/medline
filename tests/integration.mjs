@@ -1,0 +1,252 @@
+import {Miniflare} from 'miniflare';
+import {readFileSync} from 'node:fs';
+import assert from 'node:assert/strict';
+import worker, {api, nepalDay} from '../worker/index.js';
+const mf=new Miniflare({modules:true,scriptPath:'dist/server/index.js',d1Databases:['DB'],bindings:{OWNER_EMAIL:'owner@example.com',STAFF_EMAILS:'cashier@example.com,worker2@example.com',SITES_AUTH_ENABLED:'true'},compatibilityDate:'2024-12-01'});
+const db=await mf.getD1Database('DB');
+await db.exec('PRAGMA foreign_keys=ON');
+for(const file of ['drizzle/0000_shop.sql','drizzle/0001_staff_access.sql','drizzle/0002_opening_balances.sql','drizzle/0003_bill_discounts.sql','drizzle/0004_saved_sessions.sql','drizzle/0005_patient_contact_stock_management.sql'])for(const sql of readFileSync(file,'utf8').split('--> statement-breakpoint'))await db.prepare(sql.trim()).run();
+let checks=0;
+async function req(path,method='GET',body,role='owner',key=crypto.randomUUID()){
+ const headers={'Origin':'https://shop.test','Content-Type':'application/json','Idempotency-Key':key};
+ if(role!=='anonymous'){headers['oai-authenticated-user-id']=role;headers['oai-authenticated-user-email']=role+'@example.com';}
+ const r=await mf.dispatchFetch('https://shop.test/api'+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json()};
+}
+function ok(c,msg){assert.ok(c,msg);checks++;console.log('PASS',msg);}
+const encoder=new TextEncoder(), base64url=value=>Buffer.from(value).toString('base64url');
+const accessKeys=await crypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:Uint8Array.of(1,0,1),hash:'SHA-256'},true,['sign','verify']);
+const accessJwk={...await crypto.subtle.exportKey('jwk',accessKeys.publicKey),kid:'test-key',use:'sig',alg:'RS256'};
+const originalFetch=globalThis.fetch;
+globalThis.fetch=async input=>['https://test-team.cloudflareaccess.com/cdn-cgi/access/certs','https://www.googleapis.com/oauth2/v3/certs'].includes(String(input))?new Response(JSON.stringify({keys:[accessJwk]}),{headers:{'Content-Type':'application/json'}}):originalFetch(input);
+async function accessToken(email='owner@example.com',claims={}){
+ const header=base64url(JSON.stringify({alg:'RS256',kid:'test-key',typ:'JWT'})),payload=base64url(JSON.stringify({iss:'https://test-team.cloudflareaccess.com',aud:['test-audience'],sub:'test-user',email,exp:Math.floor(Date.now()/1000)+300,...claims}));
+ const signature=await crypto.subtle.sign('RSASSA-PKCS1-v1_5',accessKeys.privateKey,encoder.encode(header+'.'+payload));
+ return header+'.'+payload+'.'+base64url(signature);
+}
+async function googleToken(email='owner@example.com',claims={}){
+ const header=base64url(JSON.stringify({alg:'RS256',kid:'test-key',typ:'JWT'})),payload=base64url(JSON.stringify({iss:'https://accounts.google.com',aud:'test-google-client.apps.googleusercontent.com',sub:'google-'+email,email,email_verified:true,exp:Math.floor(Date.now()/1000)+300,...claims}));
+ const signature=await crypto.subtle.sign('RSASSA-PKCS1-v1_5',accessKeys.privateKey,encoder.encode(header+'.'+payload));
+ return header+'.'+payload+'.'+base64url(signature);
+}
+const accessEnv={DB:db,OWNER_EMAIL:'owner@example.com',STAFF_EMAILS:'cashier@example.com,worker2@example.com',CF_ACCESS_TEAM_DOMAIN:'test-team.cloudflareaccess.com',CF_ACCESS_AUD:'test-audience'};
+async function accessRequest(path,token){return api(new Request('https://shop.test/api'+path,{headers:token?{'Cf-Access-Jwt-Assertion':token}:{}}),accessEnv);}
+const googleEnv={DB:db,OWNER_EMAIL:'owner@example.com',STAFF_EMAILS:'cashier@example.com,worker2@example.com',GOOGLE_CLIENT_ID:'test-google-client.apps.googleusercontent.com',APP_ORIGIN:'https://shop.test'};
+async function googleRequest(path,token){return api(new Request('https://shop.test/api'+path,{headers:token?{Authorization:'Bearer '+token}:{}}),googleEnv);}
+try{
+ const ownerResponse=await accessRequest('/me',await accessToken());ok(ownerResponse.status===200&&(await ownerResponse.json()).role==='owner','Cloudflare Access JWT authenticates the owner');
+ await assert.rejects(accessRequest('/me',await accessToken('cashier@example.com',{aud:['wrong-audience']})),error=>error.status===401);ok(true,'Cloudflare Access token for another app is rejected');
+ await assert.rejects(accessRequest('/me',await accessToken('owner@example.com',{exp:Math.floor(Date.now()/1000)-1})),error=>error.status===401);ok(true,'Expired Cloudflare Access token is rejected');
+ await assert.rejects(accessRequest('/me','invalid.token.value'),error=>error.status===401);ok(true,'Invalid Cloudflare Access token is rejected');
+ await assert.rejects(accessRequest('/me'),error=>error.status===401);ok(true,'Missing Cloudflare Access token is rejected');
+ await assert.rejects(accessRequest('/dashboard',await accessToken('cashier@example.com')),error=>error.status===403);ok(true,'Cloudflare Access cashier cannot view owner reports');
+ const googleOwner=await googleRequest('/me',await googleToken());ok(googleOwner.status===200&&(await googleOwner.json()).role==='owner','Google identity token authenticates the owner');
+ await db.prepare("INSERT INTO staff_access(email,role,status,created_at,updated_at) VALUES(?,'worker','approved',?,?)").bind('cashier@example.com',new Date().toISOString(),new Date().toISOString()).run();
+ const googleWorker=await googleRequest('/me',await googleToken('cashier@example.com'));ok(googleWorker.status===200&&(await googleWorker.json()).role==='worker','Approved worker email receives worker role');
+ ok((await req('/medicines','GET',undefined,'cashier')).status===200,'Workers can view stock availability');
+ const pending=await googleRequest('/me',await googleToken('unapproved@example.com'));ok(pending.status===200&&(await pending.json()).role==='pending','New Google accounts wait for owner approval');
+ await assert.rejects(googleRequest('/dashboard',await googleToken('unapproved@example.com')),error=>error.status===403);ok(true,'Pending accounts cannot access shop data');
+ await assert.rejects(googleRequest('/me',await googleToken('owner@example.com',{aud:'another-client.apps.googleusercontent.com'})),error=>error.status===401);ok(true,'Google token for another app is rejected');
+ await assert.rejects(googleRequest('/me',await googleToken('owner@example.com',{exp:Math.floor(Date.now()/1000)-1})),error=>error.status===401);ok(true,'Expired Google token is rejected');
+ await assert.rejects(googleRequest('/me',await googleToken('owner@example.com',{email_verified:false})),error=>error.status===401);ok(true,'Unverified Google email is rejected');
+ const signedToken=await googleToken(),parts=signedToken.split('.');parts[2]=(parts[2][0]==='A'?'B':'A')+parts[2].slice(1);
+ await assert.rejects(googleRequest('/me',parts.join('.')),error=>error.status===401);ok(true,'Forged Google signature is rejected');
+ await assert.rejects(googleRequest('/me','invalid.token.value'),error=>error.status===401);ok(true,'Invalid Google token is rejected');
+ await assert.rejects(googleRequest('/me'),error=>error.status===401);ok(true,'Missing Google token is rejected');
+ const unconfiguredProxy={WORKER_PROXY_ONLY:'true',OWNER_EMAIL:'owner@example.com'};
+ const unconfiguredAPI=await worker.fetch(new Request('https://worker.example/api/me'),unconfiguredProxy);ok(unconfiguredAPI.status===503,'Worker API fails closed before authentication is configured');
+ const unconfiguredRoot=await worker.fetch(new Request('https://worker.example/'),unconfiguredProxy);ok(unconfiguredRoot.status===404,'Unconfigured proxy-only Worker does not serve an anonymous frontend');
+ const directRoot=await worker.fetch(new Request('https://worker.example/'),unconfiguredProxy);ok(directRoot.status===404&&!(await directRoot.text()).includes('<html'),'Proxy-only Worker does not expose the frontend outside Vercel');
+ const forgedIdentity=await worker.fetch(new Request('https://worker.example/api/me',{headers:{'oai-authenticated-user-id':'owner','oai-authenticated-user-email':'owner@example.com'}}),{...unconfiguredProxy,GOOGLE_CLIENT_ID:googleEnv.GOOGLE_CLIENT_ID});ok(forgedIdentity.status===401,'Forged identity headers cannot bypass Google token verification');
+}finally{globalThis.fetch=originalFetch;}
+try{
+ let r=await req('/receipts','POST',{name:'Test medicine',mrp_paisa:1000,quantity:100,cost_paisa:80000,purchase_date:nepalDay()});ok(r.status===201,'Receive 100 units costing NPR 800 at NPR 10 MRP');
+ const med=(await req('/medicines')).data[0];ok(med.quantity===100,'Stock equals 100');ok((await req('/purchases')).data[0].cost_paisa===80000,'Purchase history retains cost');
+ const sale={patient_name:'Verification patient',disease:'',amount_paid_paisa:2000,items:[{medicine_id:med.id,quantity:3,mrp_paisa:1000}]},key=crypto.randomUUID();
+ const rs=await Promise.all([req('/bills','POST',sale,'cashier',key),req('/bills','POST',sale,'cashier',key)]);ok(rs.every(r=>r.status<300)&&rs[0].data.id===rs[1].data.id,'Concurrent duplicate submissions create exactly one bill');
+ const id=rs[0].data.id;let bill=(await req('/bills/'+id)).data;ok(bill.total_paisa===3000&&bill.paid_paisa===2000&&bill.due_paisa===1000,'Sale is NPR 30 with NPR 20 paid and NPR 10 due');ok((await req('/medicines')).data[0].quantity===97,'Stock is 97 after sale');
+ const pk=crypto.randomUUID(),pay=await Promise.all([req('/bills/'+id+'/payments','POST',{amount_paisa:1000},'cashier',pk),req('/bills/'+id+'/payments','POST',{amount_paisa:1000},'cashier',pk)]);ok(pay.every(x=>x.status<300),'Duplicate payment posts once');bill=(await req('/bills/'+id)).data;ok(bill.due_paisa===0&&bill.payments.length===2,'Later NPR 10 payment clears dues with two history records');
+ let dash=(await req('/dashboard')).data;ok(dash.today.sales===3000&&dash.collections===3000,'Collections do not increase sales');
+ const beforeOpening=(await req('/dashboard')).data,opening=await req('/opening-dues','POST',{patient_name:'Legacy patient',disease:'Asthma',amount_paisa:5000});
+ ok(opening.status===201,'Owner can record a pre-existing patient due');
+ const openingBill=(await req('/bills/'+opening.data.id)).data;
+ ok(openingBill.is_opening_balance===1&&openingBill.total_paisa===5000&&openingBill.due_paisa===5000&&openingBill.disease==='Asthma'&&openingBill.items.length===0,'Pre-existing due is stored with its optional disease and no medicine lines');
+ ok((await req('/patients?q=Legacy')).data.some(p=>p.patient_name==='Legacy patient'),'Pre-existing due patient appears in searchable patient options');
+ let afterOpening=(await req('/dashboard')).data;
+ ok(afterOpening.today.sales===beforeOpening.today.sales&&afterOpening.month.sales===beforeOpening.month.sales&&afterOpening.outstanding.due===beforeOpening.outstanding.due+5000,'Opening due increases outstanding balances without counting as sales');
+ r=await req('/patient-payments','POST',{patient_name:'Legacy patient',amount_paisa:2000});ok(r.status===201&&(await req('/dues?q=Legacy')).data[0].due_paisa===3000,'Existing due can be partially collected through patient dues');
+ const afterLegacyCollection=(await req('/dashboard')).data;ok(afterLegacyCollection.collections===afterOpening.collections+2000&&afterLegacyCollection.today.sales===afterOpening.today.sales,'Existing due collection increases collections but not sales');
+ ok((await req('/bills/'+opening.data.id)).data.payments.length===1,'Existing due collection is saved to payment history');
+ ok((await req('/patients')).data.some(p=>p.patient_name==='Legacy patient'),'Patient remains selectable after recording a due');
+ const groupedSale={patient_name:'Grouped patient',disease:'',amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:3,mrp_paisa:1000}]};
+ const oldest=(await req('/bills','POST',groupedSale,'cashier')).data.id;await new Promise(resolve=>setTimeout(resolve,10));
+ const newer=(await req('/bills','POST',{...groupedSale,amount_paid_paisa:500,items:[{medicine_id:med.id,quantity:2,mrp_paisa:1000}]},'cashier')).data.id;
+ let grouped=(await req('/dues?q=Grouped')).data;ok(grouped.length===1&&grouped[0].patient_name==='Grouped patient'&&grouped[0].unpaid_bills===2&&grouped[0].due_paisa===4500,'Patient dues group unpaid bills and sum their balances');
+ const collectionKey=crypto.randomUUID(),beforeCollection=(await req('/dashboard')).data;
+ const groupedPay=await Promise.all([req('/patient-payments','POST',{patient_name:'Grouped patient',amount_paisa:4000},'cashier',collectionKey),req('/patient-payments','POST',{patient_name:'Grouped patient',amount_paisa:4000},'cashier',collectionKey)]);
+ ok(groupedPay.every(x=>x.status<300),'Duplicate patient collection is idempotent');
+ ok(groupedPay[0].data.allocations?.[0].bill_id===oldest&&groupedPay[0].data.allocations?.[0].amount_paisa===3000&&groupedPay[0].data.allocations?.[1].bill_id===newer&&groupedPay[0].data.allocations?.[1].amount_paisa===1000,'Patient payment allocates oldest unpaid bill first across bill history');
+ grouped=(await req('/dues?q=Grouped')).data;ok(grouped.length===1&&grouped[0].due_paisa===500&&grouped[0].unpaid_bills===1,'Partial patient collection updates the remaining grouped balance');
+ const afterCollection=(await req('/dashboard')).data;ok(afterCollection.today.sales===beforeCollection.today.sales&&afterCollection.collections===beforeCollection.collections+4000,'Patient collection increases collections without increasing sales');
+ r=await req('/patient-payments','POST',{patient_name:'Grouped patient',amount_paisa:501});ok(r.status===409,'Patient-level overpayment is rejected');
+ r=await req('/patient-payments','POST',{patient_name:'Grouped patient',amount_paisa:0});ok(r.status===400,'Zero patient payment is rejected');
+ const concurrentPatient={patient_name:'Concurrent patient',disease:'',amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:2,mrp_paisa:1000}]};
+ await req('/bills','POST',concurrentPatient,'cashier');
+ const patientRace=await Promise.all([req('/patient-payments','POST',{patient_name:'Concurrent patient',amount_paisa:1500}),req('/patient-payments','POST',{patient_name:'Concurrent patient',amount_paisa:1500})]);
+ ok(patientRace.filter(x=>x.status===201).length===1&&patientRace.filter(x=>x.status===409).length===1,'Concurrent patient collections cannot overpay a shared balance');
+ ok((await req('/dues?q=Concurrent')).data[0].due_paisa===500,'Concurrent patient collection leaves the exact unpaid balance');
+ await req('/medicines/'+med.id,'PATCH',{mrp_paisa:1200});bill=(await req('/bills/'+id)).data;ok(bill.items[0].mrp_paisa===1000,'Historical bill retains original MRP after price change');
+ const countBefore=(await req('/bills')).data.length;
+ r=await req('/bills','POST',{...sale,amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:98,mrp_paisa:1200}]});ok(r.status===409,'Insufficient stock rejected');ok((await req('/medicines')).data[0].quantity===90&&(await req('/bills')).data.length===countBefore,'Failed save leaves stock and bills unchanged');
+ const concurrentSale={...sale,amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:60,mrp_paisa:1200}]};const concurrent=await Promise.all([req('/bills','POST',concurrentSale),req('/bills','POST',concurrentSale)]);ok(concurrent.filter(x=>x.status===201).length===1&&concurrent.filter(x=>x.status===409).length===1,'Concurrent sales cannot oversell');ok((await req('/medicines')).data[0].quantity===30,'Concurrent stock balance is correct');
+ r=await req('/bills/'+id+'/payments','POST',{amount_paisa:1});ok(r.status===409,'Overpayment rejected');
+ for(const value of [-1,1.5,'100',null,1000000000001]){r=await req('/bills/'+id+'/payments','POST',{amount_paisa:value});ok(r.status===400,'Invalid payment rejected: '+value);}
+ for(const path of ['/dashboard','/purchases'])ok((await req(path,'GET',undefined,'cashier')).status===403,'Cashier direct API denied: '+path);
+ ok((await req('/receipts','POST',{name:'Denied'},'cashier')).status===403,'Cashier cannot receive stock');ok((await req('/medicines/'+med.id,'PATCH',{mrp_paisa:1},'cashier')).status===403,'Cashier cannot change MRP');
+ for(const path of ['/me','/medicines','/bills','/dashboard'])ok((await req(path,'GET',undefined,'anonymous')).status===401,'Anonymous request denied: '+path);
+ r=await req('/bills','POST',{...sale,patient_name:'Other'},'cashier',key);ok(r.status===409,'Reused key with different payload rejected');
+ const raw=await mf.dispatchFetch('https://shop.test/api/bills',{method:'POST',headers:{'oai-authenticated-user-id':'owner','oai-authenticated-user-email':'owner@example.com','Origin':'https://evil.test','Content-Type':'application/json'},body:'{}'});ok(raw.status===403,'Cross-origin write denied');
+ ok(nepalDay(new Date('2026-10-31T18:14:59Z'))==='2026-10-31'&&nepalDay(new Date('2026-10-31T18:15:00Z'))==='2026-11-01','Nepal month boundary is 18:15 UTC');
+ // Fixture belongs only to the local, disposable database.
+ const baselineOct=(await req('/dashboard?month=2026-10')).data,baselineNov=(await req('/dashboard?month=2026-11')).data; const boundaryId=crypto.randomUUID();await db.prepare('INSERT INTO bills(id,patient_name,total_paisa,created_at,actor) VALUES(?,?,?,?,?)').bind(boundaryId,'Boundary',5000,'2026-10-31T18:14:59.000Z','owner').run();await db.prepare('INSERT INTO payments(id,bill_id,amount_paisa,created_at,actor) VALUES(?,?,?,?,?)').bind(crypto.randomUUID(),boundaryId,1000,'2026-10-31T18:15:00.000Z','owner').run();
+ const workerBills=(await req('/bills','GET',undefined,'cashier')).data;ok(!workerBills.some(item=>item.id===boundaryId),'Worker bill search excludes other workers’ and owner’s bills');
+ ok(!(await req('/dues?q=Boundary','GET',undefined,'cashier')).data.length,'Worker patient dues do not reveal another account’s bills');
+ ok(!(await req('/patients?q=Legacy','GET',undefined,'cashier')).data.length,'Worker patient suggestions exclude another account’s patient records');
+ ok((await req('/dues?q=Verification','GET',undefined,'cashier')).data.length===0,'Worker dues search shows no balances for fully paid bills');
+ ok((await req('/bills/'+boundaryId,'GET',undefined,'cashier')).status===404,'Worker cannot open a bill created by the owner');
+ ok((await req('/bills/'+boundaryId+'/payments','POST',{amount_paisa:100},'cashier')).status===404,'Worker cannot collect payment for another person’s bill');
+ ok((await req('/bills/'+id,'GET',undefined,'worker2')).status===404,'A worker cannot open another worker’s bill');
+ ok((await req('/bills/'+id+'/payments','POST',{amount_paisa:100},'worker2')).status===404,'A worker cannot collect another worker’s payment');
+ ok((await req('/bills/'+boundaryId,'GET',undefined,'owner')).status===200,'Owner can open any individual bill');
+ ok((await req('/bills/'+id,'GET',undefined,'cashier')).data.patient_name==='Verification patient','Worker can reopen a bill they created');
+ const oct=(await req('/dashboard?month=2026-10')).data,nov=(await req('/dashboard?month=2026-11')).data;
+ ok(oct.month.sales===baselineOct.month.sales+5000&&oct.collections===baselineOct.collections,'Bill before Nepal midnight is October sales');ok(nov.collections===baselineNov.collections+1000&&nov.month.sales===baselineNov.month.sales,'Payment after Nepal midnight is November collection; sales stay with bill date');
+ // Multi-item transaction must roll back the first item if the second item fails.
+ await req('/receipts','POST',{name:'Second medicine',mrp_paisa:500,quantity:1,cost_paisa:100,purchase_date:nepalDay()});const second=(await req('/medicines')).data.find(m=>m.name==='Second medicine');r=await req('/bills','POST',{patient_name:'Rollback',disease:'',amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:1,mrp_paisa:1200},{medicine_id:second.id,quantity:2,mrp_paisa:500}]});ok(r.status===409&&(await req('/medicines')).data.find(m=>m.id===med.id).quantity===30,'Multi-item failure rolls back earlier stock deductions');
+ // New runtime, same D1 binding: data is independent of browser state.
+ const other=await req('/bills/'+id,'GET',undefined,'owner');ok(other.data.patient_name==='Verification patient','Owner can read a worker-created shared bill');
+ const brokenDB={prepare:db.prepare.bind(db),batch:async()=>{throw Error('Simulated database outage')}};
+ const failedRequest=new Request('https://shop.test/api/bills',{method:'POST',headers:{'Origin':'https://shop.test','Content-Type':'application/json','Idempotency-Key':crypto.randomUUID(),'oai-authenticated-user-id':'owner','oai-authenticated-user-email':'owner@example.com'},body:JSON.stringify({...sale,amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:1,mrp_paisa:1200}]})});
+ const failed=await worker.fetch(failedRequest,{DB:brokenDB,OWNER_EMAIL:'owner@example.com',SITES_AUTH_ENABLED:'true'});ok(failed.status===503&&(await req('/medicines')).data.find(x=>x.id===med.id).quantity===30,'Database outage returns a retryable error and preserves stock');
+ const failedPatientPayment=new Request('https://shop.test/api/patient-payments',{method:'POST',headers:{'Origin':'https://shop.test','Content-Type':'application/json','Idempotency-Key':crypto.randomUUID(),'oai-authenticated-user-id':'owner','oai-authenticated-user-email':'owner@example.com'},body:JSON.stringify({patient_name:'Concurrent patient',amount_paisa:400})});
+ const failedCollection=await worker.fetch(failedPatientPayment,{DB:brokenDB,OWNER_EMAIL:'owner@example.com',SITES_AUTH_ENABLED:'true'});ok(failedCollection.status===503&&(await req('/dues?q=Concurrent')).data[0].due_paisa===500,'Failed patient collection leaves every bill balance unchanged');
+ for(const quantity of [0,-1,1.5,'3']){r=await req('/bills','POST',{...sale,amount_paid_paisa:0,items:[{medicine_id:med.id,quantity,mrp_paisa:1200}]});ok(r.status===400,'Invalid quantity rejected: '+quantity);}
+ const unpaid=concurrent.find(x=>x.status===201).data.id;const concurrentPay=await Promise.all([req('/bills/'+unpaid+'/payments','POST',{amount_paisa:50000}),req('/bills/'+unpaid+'/payments','POST',{amount_paisa:50000})]);ok(concurrentPay.filter(x=>x.status===201).length===1&&concurrentPay.filter(x=>x.status===409).length===1,'Concurrent different payments cannot overpay');
+ // Names may be omitted, but unnamed bills must never share a patient balance.
+ await req('/receipts','POST',{name:'Optional name test medicine',mrp_paisa:1000,quantity:10,cost_paisa:100,purchase_date:nepalDay()});
+ const optionalMed=(await req('/medicines')).data.find(m=>m.name==='Optional name test medicine');
+ const unnamedBody={disease:'',amount_paid_paisa:0,items:[{medicine_id:optionalMed.id,quantity:1,mrp_paisa:1000}]};
+ const unnamedIds=[];
+ for(const name of [undefined,'','   ']){
+  const body={...unnamedBody,...(name===undefined?{}:{patient_name:name})},key=crypto.randomUUID();
+  const created=await req('/bills','POST',body,'cashier',key);ok(created.status===201,'Bill accepts '+(name===undefined?'omitted':name===''?'empty':'whitespace-only')+' patient name');
+  unnamedIds.push(created.data.id);
+  const detail=(await req('/bills/'+created.data.id,'GET',undefined,'cashier')).data;
+  ok(detail.patient_name===''&&detail.total_paisa===1000&&detail.due_paisa===1000,'Unnamed bill retains its own total and due');
+  const replay=await req('/bills','POST',body,'cashier',key);ok(replay.status===200&&replay.data.id===created.data.id,'Unnamed bill retry is idempotent');
+ }
+ const unnamedDues=(await req('/dues','GET',undefined,'cashier')).data.filter(d=>d.patient_name==='');
+ ok(unnamedDues.length===3&&unnamedDues.every(d=>d.unpaid_bills===1&&d.due_paisa===1000&&unnamedIds.includes(d.bill_id)),'Unnamed dues are separate rows identified by bill ID');
+ ok(!(await req('/patients','GET',undefined,'cashier')).data.some(p=>!p.patient_name.trim()),'Unnamed bills are excluded from patient suggestions');
+ ok((await req('/bills','GET',undefined,'cashier')).data.some(b=>b.id===unnamedIds[0]),'Unnamed bills remain visible in the bills list');
+ ok((await req('/bills/'+unnamedIds[0]+'/payments','POST',{amount_paisa:400},'worker2')).status===404,'Other staff cannot collect an unnamed bill');
+ ok((await req('/patient-payments','POST',{patient_name:'',amount_paisa:400},'cashier')).status===400,'Unnamed bills cannot be collected through grouped patient payments');
+ ok((await req('/bills/'+unnamedIds[0]+'/payments','POST',{amount_paisa:400},'cashier')).status===201,'Unnamed bill accepts an individual payment');
+ const afterUnnamed=(await req('/dues','GET',undefined,'cashier')).data.filter(d=>d.patient_name==='');
+ ok(afterUnnamed.find(d=>d.bill_id===unnamedIds[0]).due_paisa===600&&afterUnnamed.filter(d=>d.bill_id!==unnamedIds[0]).every(d=>d.due_paisa===1000),'Paying one unnamed bill leaves other unnamed balances unchanged');
+ for(const patient_name of [123,'x'.repeat(151)])ok((await req('/bills','POST',{...unnamedBody,patient_name})).status===400,'Invalid optional name is rejected');
+ // Explicit dues must never become fictitious cash collections.
+ const discountReceipt={name:'Due choice medicine',mrp_paisa:10000,quantity:20,cost_paisa:50000,purchase_date:nepalDay()};
+ ok((await req('/receipts','POST',discountReceipt)).status===201,'Create stock for due choices');
+ const receiptKey=crypto.randomUUID(),duplicateReceipt={...discountReceipt,name:'  DUE CHOICE MEDICINE  ',quantity:2};
+ ok((await req('/receipts','POST',duplicateReceipt,'owner',receiptKey)).status===409,'Case-insensitive duplicate stock requires confirmation');
+ let choiceMed=(await req('/medicines')).data.find(m=>m.name==='Due choice medicine');
+ ok(choiceMed.quantity===20,'Unconfirmed duplicate leaves stock unchanged');
+ const confirmed={...duplicateReceipt,confirm_existing:true};
+ const confirmedResults=await Promise.all([req('/receipts','POST',confirmed,'owner',receiptKey),req('/receipts','POST',confirmed,'owner',receiptKey)]);
+ ok(confirmedResults.every(r=>r.status<300),'Confirmed duplicate receipt supports identical concurrent retries');
+ choiceMed=(await req('/medicines')).data.find(m=>m.id===choiceMed.id);
+ ok(choiceMed.quantity===22&&(await req('/medicines')).data.filter(m=>m.name.toLowerCase()==='due choice medicine').length===1,'Confirmed stock adds one delivery to the existing medicine');
+ const beforeChoice=(await req('/dashboard')).data;
+ const choiceBody={patient_name:'Due choice patient',amount_paid_paisa:8000,due_paisa:1000,items:[{medicine_id:choiceMed.id,quantity:1,mrp_paisa:10000}]},choiceKey=crypto.randomUUID();
+ const choice=await req('/bills','POST',choiceBody,'cashier',choiceKey);
+ ok(choice.status===201,'Worker chooses a partial due below unpaid MRP');
+ let choiceBill=(await req('/bills/'+choice.data.id,'GET',undefined,'cashier')).data;
+ ok(choiceBill.total_paisa===9000&&choiceBill.paid_paisa===8000&&choiceBill.due_paisa===1000&&choiceBill.discount_paisa===1000,'100 MRP minus 80 paid and 10 due records a 10 discount');
+ ok(choiceBill.payments.length===1&&choiceBill.payments[0].amount_paisa===8000&&choiceBill.items[0].mrp_paisa===10000,'Actual payment and original MRP are preserved');
+ const choiceRetry=await req('/bills','POST',choiceBody,'cashier',choiceKey);
+ ok(choiceRetry.status===200&&choiceRetry.data.id===choice.data.id,'Custom due bill retries do not duplicate discounts or stock deductions');
+ const afterChoice=(await req('/dashboard')).data;
+ ok(afterChoice.today.sales===beforeChoice.today.sales+9000&&afterChoice.collections===beforeChoice.collections+8000&&afterChoice.outstanding.due===beforeChoice.outstanding.due+1000,'Reports count net sales, actual cash and chosen dues separately');
+ const noDue=await req('/bills','POST',{...choiceBody,due_paisa:0},'cashier');
+ const noDueBill=(await req('/bills/'+noDue.data.id,'GET',undefined,'cashier')).data;
+ ok(noDueBill.total_paisa===8000&&noDueBill.discount_paisa===2000&&noDueBill.due_paisa===0&&noDueBill.payments[0].amount_paisa===8000,'Keep no due discounts the remaining MRP without inventing payment');
+ ok(!(await req('/dues?q=Due%20choice','GET',undefined,'cashier')).data.some(d=>d.due_paisa!==1000),'Only selected due appears in outstanding balances');
+ ok((await req('/bills/'+noDue.data.id+'/payments','POST',{amount_paisa:1},'cashier')).status===409,'Discounted no-due bill rejects additional collections');
+ ok((await req('/bills/'+choice.data.id+'/payments','POST',{amount_paisa:1001},'cashier')).status===409,'Chosen due remains the payment limit');
+ ok((await req('/bills/'+choice.data.id+'/payments','POST',{amount_paisa:1000},'cashier')).status===201,'Later payment collects only the chosen due');
+ choiceBill=(await req('/bills/'+choice.data.id,'GET',undefined,'cashier')).data;
+ ok(choiceBill.due_paisa===0&&choiceBill.discount_paisa===1000&&choiceBill.payments.length===2,'Clearing chosen due retains discount and payment history');
+ for(const due of [-1,1.5,'100',null,1000000000001])ok((await req('/bills','POST',{...choiceBody,due_paisa:due},'cashier')).status===400,'Invalid chosen due rejected: '+due);
+ const free=await req('/bills','POST',{...choiceBody,amount_paid_paisa:0,due_paisa:0},'cashier');
+ const freeBill=(await req('/bills/'+free.data.id,'GET',undefined,'cashier')).data;
+ ok(free.status===201&&freeBill.total_paisa===0&&freeBill.discount_paisa===10000&&!freeBill.payments.length,'Fully waived bill records zero cash, zero due and full discount');
+ const raceBody={...discountReceipt,name:'Concurrent new stock',quantity:1},race=await Promise.all([req('/receipts','POST',raceBody),req('/receipts','POST',raceBody)]);
+ ok(race.filter(r=>r.status===201).length===1&&race.filter(r=>r.status===409).length===1,'Concurrent new stock cannot bypass duplicate confirmation');
+ const newReceiptKey=crypto.randomUUID(),newReceipt={...discountReceipt,name:'New stock retry',quantity:3};
+ const newReceipts=await Promise.all([req('/receipts','POST',newReceipt,'owner',newReceiptKey),req('/receipts','POST',newReceipt,'owner',newReceiptKey)]);
+ ok(newReceipts.every(r=>r.status<300)&&newReceipts[0].data.id===newReceipts[1].data.id,'Concurrent identical new stock submissions replay the same receipt');
+ ok((await req('/medicines')).data.find(m=>m.name===newReceipt.name).quantity===3,'Concurrent receipt retry adds stock exactly once');
+ // Payments and chosen dues are independent of the medicine MRP.
+ await req('/receipts','POST',{name:'Editable stock',mrp_paisa:10000,quantity:30,cost_paisa:50000,purchase_date:nepalDay()});
+ let editable=(await req('/medicines')).data.find(m=>m.name==='Editable stock');
+ const arbitrary={patient_name:'Contact patient',contact_number:'+977 9812345678',amount_paid_paisa:50000,due_paisa:20000,items:[{medicine_id:editable.id,quantity:1,mrp_paisa:10000}]};
+ const beforeArbitrary=(await req('/dashboard')).data,arbitrarySale=await req('/bills','POST',arbitrary,'cashier');
+ ok(arbitrarySale.status===201,'Worker saves payment and due above the MRP total');
+ const arbitraryBill=(await req('/bills/'+arbitrarySale.data.id)).data;
+ ok(arbitraryBill.total_paisa===70000&&arbitraryBill.paid_paisa===50000&&arbitraryBill.due_paisa===20000&&arbitraryBill.additional_charge_paisa===60000&&arbitraryBill.discount_paisa===0,'500 paid plus 200 chosen due is a 700 bill regardless of 100 MRP');
+ ok(arbitraryBill.contact_number===arbitrary.contact_number&&arbitraryBill.items[0].mrp_paisa===10000&&arbitraryBill.payments[0].amount_paisa===50000,'Contact, reviewed MRP and actual cash remain intact');
+ const afterArbitrary=(await req('/dashboard')).data;
+ ok(afterArbitrary.today.sales===beforeArbitrary.today.sales+70000&&afterArbitrary.collections===beforeArbitrary.collections+50000&&afterArbitrary.outstanding.due===beforeArbitrary.outstanding.due+20000,'Above-MRP bill updates sales, cash collections and dues accurately');
+ ok((await req('/patients?q=Contact','GET',undefined,'cashier')).data[0].contact_number===arbitrary.contact_number,'Patient suggestions return the saved optional contact');
+ ok(!(await req('/patients?q=Contact','GET',undefined,'worker2')).data.length,'Other workers cannot read patient contact numbers');
+ ok((await req('/dues?q=Contact','GET',undefined,'cashier')).data[0].contact_number===arbitrary.contact_number,'Contact appears with patient outstanding dues');
+ const noMRPCap=await req('/bills','POST',{...arbitrary,patient_name:'Above MRP',contact_number:'',due_paisa:0},'cashier');
+ ok(noMRPCap.status===201&&(await req('/bills/'+noMRPCap.data.id)).data.total_paisa===50000,'Payment above MRP with no due is accepted without a cap');
+ const automatic=await req('/bills','POST',{...arbitrary,patient_name:'Automatic due',contact_number:undefined,due_paisa:undefined},'cashier');
+ const automaticBill=(await req('/bills/'+automatic.data.id)).data;
+ ok(automatic.status===201&&automaticBill.due_paisa===0&&automaticBill.contact_number==='','Omitted due defaults to zero above MRP and contact stays optional');
+ for(const contact of [42,'x'.repeat(41)])ok((await req('/bills','POST',{...arbitrary,contact_number:contact},'cashier')).status===400,'Invalid contact shape is rejected');
+ const contactOpening=await req('/opening-dues','POST',{patient_name:'Existing contact',amount_paisa:1000,contact_number:'01-5551234'});
+ ok(contactOpening.status===201&&(await req('/bills/'+contactOpening.data.id)).data.contact_number==='01-5551234','Pre-existing patient dues also accept an optional contact');
+ editable=(await req('/medicines')).data.find(m=>m.id===editable.id);
+ const reviewed={expected_name:editable.name,expected_mrp_paisa:editable.mrp_paisa,expected_quantity:editable.quantity};
+ for(const method of ['PATCH','DELETE'])ok((await req('/medicines/'+editable.id,method,{...reviewed,name:'Changed',mrp_paisa:12000,quantity:12},'cashier')).status===403,'Worker cannot '+method+' inventory');
+ const historyCount=(await req('/purchases')).data.length;
+ const edited=await req('/medicines/'+editable.id,'PATCH',{...reviewed,name:'Updated stock',mrp_paisa:12000,quantity:12});
+ ok(edited.status===201,'Inventory manager updates name, MRP and stock quantity');
+ editable=(await req('/medicines')).data.find(m=>m.id===editable.id);
+ ok(editable.name==='Updated stock'&&editable.mrp_paisa===12000&&editable.quantity===12,'Updated stock is immediately visible');
+ ok((await req('/purchases')).data.length===historyCount&&(await req('/bills/'+arbitrarySale.data.id)).data.items[0].medicine_name==='Editable stock','Stock correction preserves purchase history and past bill snapshots');
+ ok((await req('/medicines/'+editable.id,'PATCH',{...reviewed,name:'Stale update'})).status===409,'Stale edit cannot overwrite newer stock');
+ ok((await req('/medicines/'+editable.id,'DELETE',reviewed)).status===409,'Stale delete cannot discard newly changed stock');
+ const snapshot={expected_name:editable.name,expected_mrp_paisa:editable.mrp_paisa,expected_quantity:editable.quantity};
+ const conflicts=await Promise.all([req('/medicines/'+editable.id,'PATCH',{...snapshot,quantity:13}),req('/medicines/'+editable.id,'PATCH',{...snapshot,quantity:14})]);
+ ok(conflicts.filter(r=>r.status===201).length===1&&conflicts.filter(r=>r.status===409).length===1,'Concurrent stock edits cannot silently overwrite each other');
+ editable=(await req('/medicines')).data.find(m=>m.id===editable.id);
+ ok((await req('/medicines/'+editable.id,'PATCH',{name:choiceMed.name})).status===409,'Rename to another medicine rolls back without merging stock');
+ const deleteBody={expected_name:editable.name,expected_mrp_paisa:editable.mrp_paisa,expected_quantity:editable.quantity},deleteKey=crypto.randomUUID();
+ const deleted=await req('/medicines/'+editable.id,'DELETE',deleteBody,'owner',deleteKey);
+ ok(deleted.status===201&&!(await req('/medicines')).data.some(m=>m.id===editable.id),'Deleted medicine disappears from active stock');
+ ok((await req('/medicines/'+editable.id,'DELETE',deleteBody,'owner',deleteKey)).status===200,'Delete retry is idempotent');
+ const archived=(await req('/medicines?include_deleted=true')).data.find(m=>m.id===editable.id);
+ ok(archived.deleted_at&&archived.quantity===0,'Deleted stock retains its history reference with zero available units');
+ ok((await req('/medicines?include_deleted=true','GET',undefined,'cashier')).status===403,'Worker cannot list deleted inventory');
+ ok((await req('/bills/'+arbitrarySale.data.id)).data.items[0].medicine_name==='Editable stock'&&(await req('/purchases?medicine_id='+editable.id)).data.length===1,'Deleting stock preserves every past bill and receipt');
+ ok((await req('/bills','POST',{...arbitrary,items:[{medicine_id:editable.id,quantity:1,mrp_paisa:12000}]},'cashier')).status===409,'Deleted medicine cannot be sold from a stale bill draft');
+ ok((await req('/medicines/'+editable.id,'PATCH',{quantity:1})).status===404,'Deleted medicine cannot be edited through an old link');
+ const restored=await req('/receipts','POST',{name:editable.name,mrp_paisa:12000,quantity:5,cost_paisa:2000,purchase_date:nepalDay(),confirm_existing:true});
+ const restoredMed=(await req('/medicines')).data.find(m=>m.id===editable.id);
+ ok(restored.status===201&&restoredMed.quantity===5&&!restoredMed.deleted_at,'Confirmed new delivery restores deleted medicine without restoring removed quantity');
+ ok((await db.prepare('SELECT COUNT(*) AS count FROM stock_changes WHERE medicine_id=?').bind(editable.id).first()).count===3,'Only successful edit and delete operations are retained in stock audit history');
+ console.log(`\n${checks} integration checks passed. Local fixtures only; production remains empty.`);
+}finally{globalThis.fetch=originalFetch;await mf.dispose();}

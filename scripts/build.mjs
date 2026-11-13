@@ -1,0 +1,14 @@
+import {readFileSync,writeFileSync,mkdirSync,rmSync,cpSync} from 'node:fs';
+import {resolve} from 'node:path';
+import {build} from 'esbuild';
+import {pwaAssets} from './pwa-assets.mjs';
+const worker=readFileSync('worker/index.js','utf8'),html=readFileSync('worker/app.html','utf8');
+const appAssignment=/const APP_HTML = (?:`[\s\S]*`|'__APP_HTML__');\s*$/;
+const workerHTML=html.replace('__GOOGLE_CLIENT_ID__',process.env.GOOGLE_CLIENT_ID||'');
+const assets=await pwaAssets();
+const builtWorker=worker.replace("'__PWA_ASSETS__'",()=>JSON.stringify(assets)).replace(appAssignment,()=>`const APP_HTML = ${JSON.stringify(workerHTML)};`);
+if(builtWorker===worker)throw new Error('Could not find the Worker HTML assignment.');
+rmSync('dist',{recursive:true,force:true});mkdirSync('dist/server',{recursive:true});mkdirSync('dist/.openai',{recursive:true});
+await build({stdin:{contents:builtWorker,resolveDir:resolve('worker'),sourcefile:'index.js'},bundle:true,format:'esm',platform:'browser',target:'es2022',outfile:'dist/server/index.js'});
+cpSync('.openai/hosting.json','dist/.openai/hosting.json');
+console.log('Built Worker with verified Google identity support and embedded UI.');

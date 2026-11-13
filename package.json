@@ -1,0 +1,19 @@
+{
+  "name": "medicine-sales-manager",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:vercel": "node scripts/build-vercel.mjs",
+    "validate": "node scripts/validate-artifact.mjs",
+    "test": "node tests/integration.mjs && node tests/vercel-proxy.mjs && node tests/access-control.mjs && node tests/pwa.mjs && node tests/billing-ui.mjs && node tests/sessions.mjs && node tests/session-ui.mjs",
+    "dev": "node scripts/dev.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "miniflare": "^3.20250718.3"
+  },
+  "dependencies": {
+    "jose": "^6.2.17"
+  }
+}

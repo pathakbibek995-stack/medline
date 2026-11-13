@@ -1,0 +1,17 @@
+{
+  "id": "/",
+  "name": "Medicine Sales Manager",
+  "short_name": "Medicine Sales",
+  "description": "Manage shop stock, patient bills and payments. An internet connection is required.",
+  "lang": "en",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f8f8",
+  "theme_color": "#087f78",
+  "icons": [
+    {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

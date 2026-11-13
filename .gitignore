@@ -1,0 +1,10 @@
+dist/
+public/
+site.tar.gz
+node_modules/
+outputs/
+.wrangler/
+.vercel/
+.env*
+.dev.vars*
+.vercel

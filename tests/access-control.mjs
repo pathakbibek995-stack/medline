@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict';
+import {Miniflare} from 'miniflare';
+import {readFileSync} from 'node:fs';
+import worker from '../worker/index.js';
+const mf=new Miniflare({modules:true,scriptPath:'dist/server/index.js',d1Databases:['DB'],compatibilityDate:'2024-12-01'});
+const db=await mf.getD1Database('DB');
+for(const file of ['drizzle/0000_shop.sql','drizzle/0001_staff_access.sql','drizzle/0002_opening_balances.sql','drizzle/0003_bill_discounts.sql','drizzle/0004_saved_sessions.sql','drizzle/0005_patient_contact_stock_management.sql'])for(const sql of readFileSync(file,'utf8').split('--> statement-breakpoint'))await db.prepare(sql.trim()).run();
+const keys=await crypto.subtle.generateKey({name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:Uint8Array.of(1,0,1),hash:'SHA-256'},true,['sign','verify']);
+const jwk={...await crypto.subtle.exportKey('jwk',keys.publicKey),kid:'access-test',use:'sig',alg:'RS256'};
+const originalFetch=globalThis.fetch;
+globalThis.fetch=async input=>String(input)==='https://www.googleapis.com/oauth2/v3/certs'?Response.json({keys:[jwk]}):originalFetch(input);
+const env={DB:db,OWNER_EMAIL:'owner@example.com',GOOGLE_CLIENT_ID:'test-client.apps.googleusercontent.com',APP_ORIGIN:'https://shop.test',WORKER_PROXY_ONLY:'true'};
+const b64=value=>Buffer.from(value).toString('base64url');
+async function token(email,claims={}){const header=b64(JSON.stringify({alg:'RS256',kid:jwk.kid})),payload=b64(JSON.stringify({iss:'https://accounts.google.com',aud:env.GOOGLE_CLIENT_ID,sub:'google-'+email,email,email_verified:true,name:email.split('@')[0],iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+300,...claims}));return header+'.'+payload+'.'+b64(await crypto.subtle.sign('RSASSA-PKCS1-v1_5',keys.privateKey,new TextEncoder().encode(header+'.'+payload)));}
+async function request(email,path,method='GET',body,claims={}){const headers={Origin:env.APP_ORIGIN,'Content-Type':'application/json','Idempotency-Key':crypto.randomUUID()};if(email)headers.Authorization='Bearer '+await token(email,claims);const r=await worker.fetch(new Request(env.APP_ORIGIN+'/api'+path,{method,headers,body:body===undefined?undefined:JSON.stringify(body)}),env);return {status:r.status,data:await r.json()};}
+let checks=0;const pass=(value,message)=>{assert.ok(value,message);checks++;console.log('PASS',message);};
+try{
+ let r=await request('owner@example.com','/me');pass(r.status===200&&r.data.role==='owner'&&r.data.canManageAccess&&r.data.canViewReports&&r.data.canEditStock,'Configured verified Google email is the permanent owner');
+ r=await request('new@example.com','/me');pass(r.status===200&&r.data.role==='pending'&&!r.data.canManageInventory,'New Google sign-in creates a pending account without shop access');
+ for(const [path,method,body] of [['/dashboard','GET'],['/medicines','GET'],['/bills','GET'],['/patients','GET'],['/receipts','POST',{}],['/opening-dues','POST',{patient_name:'Pending due',amount_paisa:100}],['/access','POST',{email:'new@example.com',role:'admin',status:'approved'}]]){r=await request('new@example.com',path,method,body);pass(r.status===403,'Pending account is denied '+path);}
+ r=await request('owner@example.com','/access');pass(r.data.some(x=>x.email==='new@example.com'&&x.status==='pending'),'Owner sees Google sign-ins awaiting approval');
+ r=await request('owner@example.com','/access','POST',{email:'new@example.com',role:'worker',status:'approved'});pass(r.status===200,'Owner can approve a worker by email');
+ r=await request('new@example.com','/me');pass(r.data.role==='worker'&&!r.data.canManageInventory&&!r.data.canManageAccess,'Approved worker has billing permissions only');
+ for(const [path,method,body] of [['/dashboard','GET'],['/purchases','GET'],['/receipts','POST',{}],['/opening-dues','POST',{patient_name:'Restricted due',amount_paisa:500}],['/medicines/unknown','PATCH',{mrp_paisa:10}],['/access','GET'],['/access','POST',{email:'new@example.com',role:'admin',status:'approved'}]]){r=await request('new@example.com',path,method,body);pass(r.status===403,'Worker cannot manage inventory, reports, opening dues, or access: '+path);}
+ r=await request('owner@example.com','/receipts','POST',{name:'Role test medicine',mrp_paisa:1000,quantity:10,cost_paisa:5000,purchase_date:new Date(Date.now()+345*60000).toISOString().slice(0,10)});pass(r.status===201,'Owner can receive stock');
+ const med=(await request('new@example.com','/medicines')).data[0];
+ r=await request('new@example.com','/bills','POST',{patient_name:'Access test patient',disease:'',amount_paid_paisa:500,items:[{medicine_id:med.id,quantity:1,mrp_paisa:1000}]});pass(r.status===201,'Worker can create an individual patient bill and initial payment');
+ const billId=r.data.id;
+ r=await request('new@example.com','/bills/'+billId);pass(r.status===200&&r.data.patient_name==='Access test patient','Worker can reopen their individual patient bill');
+ r=await request('new@example.com','/bills/'+billId+'/payments','POST',{amount_paisa:500});pass(r.status===201,'Worker can collect payment for their patient bill');
+ r=await request('owner@example.com','/access','POST',{email:'admin@example.com',role:'admin',status:'approved'});pass(r.status===200,'Owner can approve an admin before their first sign-in');
+ r=await request('admin@example.com','/me');pass(r.data.role==='admin'&&r.data.canManageInventory&&!r.data.canManageAccess&&!r.data.canViewReports&&!r.data.canEditStock,'Inventory admin can manage stock but has no owner or report access');
+ r=await request('admin@example.com','/opening-dues','POST',{patient_name:'Admin legacy patient',disease:'',amount_paisa:2500});pass(r.status===201,'Inventory admin can record a pre-existing patient due');
+ r=await request('admin@example.com','/patients?q=Admin');pass(r.status===200&&r.data.some(p=>p.patient_name==='Admin legacy patient'),'Inventory admin can search their pre-existing patient');
+ r=await request('admin@example.com','/dashboard');pass(r.status===403,'Inventory admin cannot view financial reports');
+ r=await request('admin@example.com','/bills');pass(r.status===200&&r.data.length===1&&r.data[0].patient_name==='Admin legacy patient','Inventory admin can see their opening balance but not another user’s bills');
+ r=await request('admin@example.com','/bills/'+billId);pass(r.status===404,'Inventory admin cannot open an individual bill created by a worker');
+ r=await request('admin@example.com','/purchases');pass(r.status===200&&r.data.length===1,'Inventory admin can view stock purchase history');
+ r=await request('owner@example.com','/bills');pass(r.status===200&&r.data.length===2,'Owner can view bills across staff accounts');
+ r=await request('admin@example.com','/bills','POST',{patient_name:'Admin patient',disease:'',amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:1,mrp_paisa:1000}]});pass(r.status===201,'Inventory admin can create their own patient bill');
+ const adminBillId=r.data.id;
+ r=await request('admin@example.com','/bills/'+adminBillId);pass(r.status===200&&r.data.patient_name==='Admin patient','Inventory admin can view their own patient bill');
+ r=await request('new@example.com','/bills','POST',{patient_name:'Worker due patient',disease:'',amount_paid_paisa:0,items:[{medicine_id:med.id,quantity:1,mrp_paisa:1000}]});pass(r.status===201,'Worker can create a bill with an outstanding balance');
+ r=await request('new@example.com','/patients?q=Worker');pass(r.status===200&&r.data.length===1&&r.data[0].patient_name==='Worker due patient','Worker can search/select their existing patient');
+ r=await request('new@example.com','/dues');pass(r.status===200&&r.data.some(d=>d.patient_name==='Worker due patient')&&!r.data.some(d=>d.patient_name==='Admin patient'),'Worker dues are limited to bills they created');
+ r=await request('admin@example.com','/dues');pass(r.status===200&&r.data.some(d=>d.patient_name==='Admin patient')&&!r.data.some(d=>d.patient_name==='Worker due patient'),'Inventory admin dues are limited to bills they created');
+ r=await request('new@example.com','/patient-payments','POST',{patient_name:'Admin patient',amount_paisa:500});pass(r.status===404,'Worker cannot collect another account’s patient dues');
+ r=await request('owner@example.com','/dues');pass(r.status===200&&r.data.some(d=>d.patient_name==='Worker due patient')&&r.data.some(d=>d.patient_name==='Admin patient'),'Owner can view outstanding dues across staff accounts');
+ r=await request('owner@example.com','/patients?q=patient');pass(r.status===200&&r.data.some(p=>p.patient_name==='Worker due patient')&&r.data.some(p=>p.patient_name==='Admin patient'),'Owner patient search includes names created by staff');
+ r=await request('new@example.com','/patient-payments','POST',{patient_name:'Worker due patient',amount_paisa:500});pass(r.status===201,'Worker can collect grouped dues for their own patient');
+ r=await request('admin@example.com','/access','POST',{email:'other@example.com',role:'admin',status:'approved'});pass(r.status===403,'An admin cannot approve accounts or assign roles');
+ r=await request('owner@example.com','/access','POST',{email:'new@example.com',role:'admin',status:'approved'});pass(r.status===200&&(await request('new@example.com','/me')).data.role==='admin','Owner can change Worker to Admin');
+ r=await request('owner@example.com','/access','POST',{email:'new@example.com',role:'worker',status:'approved'});pass(r.status===200&&(await request('new@example.com','/dashboard')).status===403,'Demotion removes dashboard access immediately');
+ r=await request('owner@example.com','/access','POST',{email:'new@example.com',role:'worker',status:'revoked'});pass(r.status===200&&(await request('new@example.com','/bills/'+billId)).status===403,'Revocation blocks existing Google tokens on the next request');
+ r=await request('owner@example.com','/access','POST',{email:'OWNER@example.com',role:'worker',status:'revoked'});pass(r.status===403,'The owner account cannot be revoked or demoted');
+ r=await request('owner@example.com','/access','POST',{email:'other@example.com',role:'owner',status:'approved'});pass(r.status===400,'The API never accepts a new owner role');
+ r=await request(null,'/me');pass(r.status===401,'Anonymous access remains blocked');
+ r=await request('owner@example.com','/me','GET',undefined,{aud:'wrong-client'});pass(r.status===401,'Tokens issued for another Google application are rejected');
+ r=await request('owner@example.com','/me','GET',undefined,{email_verified:false});pass(r.status===401,'Unverified email claims cannot gain owner privileges');
+ await request('admin@example.com','/receipts','POST',{name:'Admin edit stock',mrp_paisa:1000,quantity:5,cost_paisa:1000,purchase_date:new Date(Date.now()+345*60000).toISOString().slice(0,10)});
+ const adminStock=(await request('admin@example.com','/medicines')).data.find(m=>m.name==='Admin edit stock');
+ r=await request('admin@example.com','/medicines/'+adminStock.id,'PATCH',{name:'Admin updated stock',mrp_paisa:1500,quantity:9});pass(r.status===403,'Inventory admin cannot edit stock name, MRP or quantity');
+ r=await request('admin@example.com','/medicines/'+adminStock.id,'DELETE',{});pass(r.status===403,'Inventory admin cannot delete stock');
+ r=await request('admin@example.com','/medicines/'+adminStock.id,'PATCH',{mrp_paisa:1500});pass(r.status===403,'Legacy MRP endpoint also rejects inventory admin edits');
+ const adminReceipt={name:adminStock.name,mrp_paisa:1000,quantity:2,cost_paisa:1000,purchase_date:new Date(Date.now()+345*60000).toISOString().slice(0,10),confirm_existing:true};
+ r=await request('admin@example.com','/receipts','POST',{...adminReceipt,mrp_paisa:1500});pass(r.status===403,'Inventory admin cannot change existing MRP through a stock receipt');
+ let currentStock=(await request('admin@example.com','/medicines')).data.find(m=>m.id===adminStock.id);
+ pass(currentStock.name===adminStock.name&&currentStock.mrp_paisa===1000&&currentStock.quantity===5,'Denied inventory edits leave the medicine unchanged');
+ r=await request('admin@example.com','/receipts','POST',adminReceipt);pass(r.status===201,'Inventory admin can add a delivery to existing stock');
+ currentStock=(await request('admin@example.com','/medicines')).data.find(m=>m.id===adminStock.id);
+ pass(currentStock.quantity===7&&currentStock.mrp_paisa===1000,'Inventory admin receipt adds quantity while preserving MRP');
+ r=await request('owner@example.com','/medicines/'+adminStock.id,'PATCH',{name:'Owner updated stock',mrp_paisa:1500,quantity:9});pass(r.status===201,'Only the owner can edit stock name, MRP and quantity');
+ r=await request('owner@example.com','/medicines/'+adminStock.id,'DELETE',{});pass(r.status===201&&!(await request('admin@example.com','/medicines')).data.some(m=>m.id===adminStock.id),'Only the owner can delete stock from active inventory');
+ r=await request('admin@example.com','/receipts','POST',{...adminReceipt,name:'Owner updated stock',mrp_paisa:1500});pass(r.status===403,'Inventory admin cannot undo owner deletion through a receipt');
+ r=await request('admin@example.com','/medicines?include_deleted=true');pass(r.status===403,'Deleted inventory is restricted to the owner');
+ const audit=await db.prepare('SELECT COUNT(*) AS count FROM access_audit').first();pass(audit.count===5,'Every successful approval, role change, and revocation is audited');
+ console.log(`${checks} access-control checks passed. Disposable local records only.`);
+}finally{globalThis.fetch=originalFetch;await mf.dispose();}
